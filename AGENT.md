@@ -1,0 +1,1 @@
+这是一个以教育为目的的AI项目。项目详情请使用obsidian-pkm技能访问SquareLab.
