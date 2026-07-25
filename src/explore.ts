@@ -1,6 +1,7 @@
 import "dotenv/config"
 import OpenAI from "openai"
 import readline from "readline/promises"
+import { readFileSync } from "node:fs"
 
 /**
  * Cairn · Phase 1 · Explore MVP
@@ -106,11 +107,37 @@ const tools: OpenAI.Responses.Tool[] = [
 ]
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 想清楚要告诉模型：它是谁、任务是什么、什么时候该用 web_search、
-// 以及「必须以调用 constructKnowledgeGraph 来结束」。这决定循环能不能干净收尾。
+// 学习者画像：本阶段先写死一个常量（就是你）。它让 system prompt 能「根据背景」
+// 裁剪概念——同一份资料，对新手和专家该抽出的「主要概念」并不一样。
+// 可配置化（不同学习者、运行时传入）留到 Phase 5 有 UI 再说；现在写死最省事、够用。
+// ─────────────────────────────────────────────────────────────────────────────
+const LEARNER_PROFILE = `
+- 有 TypeScript / JavaScript 编程背景。
+- AI 应用开发新手，正在从原语一步步学起。
+- 目的是学习理解，偏好抓住主干、先建立整体心智模型，再逐步深入细节。
+`.trim()
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 提示词设计（本阶段要吃透的核心概念之一）。几个刻意的取舍：
+//   · 引用 LEARNER_PROFILE：让「抽什么」随学习者背景而变，而非对资料穷举。
+//   · 少而精：明确要求聚焦最核心的少量概念（软上限 5-7 个），先立骨干。
+//     ——直接回应「概念太多」：穷举会淹没初学者，主干清晰才谈得上心智模型。
+//   · 留话头：说明后续追问时才增量补充。这为「增量建图」埋点，但本阶段不实现。
+//   · 收尾契约：必须以调用 constructKnowledgeGraph 结束，别用自然语言把图谱「说」出来。
 // ─────────────────────────────────────────────────────────────────────────────
 const INSTRUCTIONS = `
-你是用户的学习助手、陪伴者。你的任务是对输入的学习资料明确主题，抽取关键概念，建立联系，构建知识图谱。
+你是学习者的学习助手与陪伴者。你的任务：对输入的学习资料明确主题，抽取核心概念、建立它们之间的关系，构建一张知识图谱。
+
+学习者画像：
+${LEARNER_PROFILE}
+
+抽取原则：
+- 少而精。只抽取该主题最核心的少量主要概念（通常 5-7 个，宁少勿多），先立起主干骨架，而不是穷举资料里出现的每一个术语。
+- 因人而异。根据上面的学习者画像裁剪：对一个初学者，什么才是理解这个主题绕不开的骨干概念？次要的、进阶的细节暂时略去。
+- 关系清晰。概念之间用简短的关系词连接（如「属于」「对抗」「用于」），让骨架能读出结构。
+- 增量留白。学习者若在后续追问中表达疑惑，届时再补充相关的细分概念——这一轮不必求全。
+
+收尾：完成抽取后，必须调用 constructKnowledgeGraph 交回图谱，不要用自然语言把图谱内容复述出来。
 `.trim()
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -139,14 +166,81 @@ async function executeFunctionCall(
 //   c. 返回一段字符串作为 Observation（比如 "已保存，12 个节点 / 18 条边" 或 "用户拒绝"）。
 // ─────────────────────────────────────────────────────────────────────────────
 function constructKnowledgeGraph(args: unknown): string {
-    console.log("constructKnowledgeGraph receive arguments：", JSON.stringify(args, null, 2))
     try {
         const graph = parseKnowledgeGraph(args);
-        console.log(`KnowledgeGraph:\n ${JSON.stringify(graph, null, 2)}`);
+        // 可审阅：把图谱摊成人能扫读的文本，而不是一坨 JSON。这一步是「可观测性」的落点。
+        console.log(renderKnowledgeGraph(graph));
         return `construct ${graph.nodes.length} nodes and ${graph.edges.length} edges`;
     } catch (e) {
         return `KnowledgeGraph verificaton fail: ${(e as Error).message}`
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 渲染：把 KnowledgeGraph 排版成人能扫一眼看懂的文本。纯函数、无副作用——
+// 只吃一个 graph、吐一个 string，好测、好复用，和「执行/IO」分开。
+//
+// 不引入 chalk 等库，直接用 ANSI 转义码上色（先原语，不给学习骨架加噪音）。
+// 呈现三块：① 摘要 ② 概念按 type 分组 ③ 关系用 起点 ──关系──▶ 终点。
+// 顺带做「悬空边」检测：边引用了不存在的 node id → 标红，这正是审阅时最该看见的。
+// ─────────────────────────────────────────────────────────────────────────────
+const C = {
+    dim: (s: string) => `\x1b[2m${s}\x1b[0m`,        // 灰：次要信息（id）
+    bold: (s: string) => `\x1b[1m${s}\x1b[0m`,       // 粗：标题
+    cyan: (s: string) => `\x1b[36m${s}\x1b[0m`,      // 青：概念 label
+    yellow: (s: string) => `\x1b[33m${s}\x1b[0m`,    // 黄：关系
+    red: (s: string) => `\x1b[31m${s}\x1b[0m`,       // 红：悬空边告警
+}
+
+export function renderKnowledgeGraph(graph: KnowledgeGraph): string {
+    const { nodes, edges } = graph
+    const lines: string[] = []
+
+    // ① 摘要
+    lines.push("")
+    lines.push(C.bold(`◆ 知识图谱  ${nodes.length} 个概念 · ${edges.length} 条关系`))
+
+    // 建 id → node 索引：既给关系渲染用 label，也用来查悬空边。
+    const byId = new Map(nodes.map((n) => [n.id, n]))
+
+    // ② 概念：按 type 分组
+    lines.push("")
+    lines.push(C.bold("概念"))
+    const groups = new Map<string, GraphNode[]>()
+    for (const n of nodes) {
+        const g = groups.get(n.type) ?? []
+        g.push(n)
+        groups.set(n.type, g)
+    }
+    for (const [type, members] of groups) {
+        lines.push(`  ${C.dim("┌")} ${type}`)
+        for (const n of members) {
+            lines.push(`  ${C.dim("│")}   ${C.cyan(n.label)}  ${C.dim(n.id)}`)
+        }
+    }
+
+    // ③ 关系：起点 ──关系──▶ 终点。用 label 显示（找不到就退回 id 并标红）。
+    lines.push("")
+    lines.push(C.bold("关系"))
+    const danglingSeen = new Set<string>()
+    const nameOf = (id: string): string => {
+        const node = byId.get(id)
+        if (node) return C.cyan(node.label)
+        danglingSeen.add(id)
+        return C.red(`${id}?`)   // 悬空：这个 id 没有对应节点
+    }
+    for (const e of edges) {
+        lines.push(`  ${nameOf(e.from)} ${C.dim("──")}${C.yellow(e.relation)}${C.dim("──▶")} ${nameOf(e.to)}`)
+    }
+
+    // 悬空边告警：审阅时最该被看见的完整性问题。
+    if (danglingSeen.size > 0) {
+        lines.push("")
+        lines.push(C.red(`⚠ ${danglingSeen.size} 个悬空引用（边指向了不存在的概念）：${[...danglingSeen].join(", ")}`))
+    }
+
+    lines.push("")
+    return lines.join("\n")
 }
 
 function isGraphNode(x: unknown): x is GraphNode {
@@ -229,18 +323,38 @@ async function runExplore(query: string): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CLI 入口：读一行输入（文本或 URL 或文档）
+// CLI 入口。两种喂料方式：
+//   · 有文件参数：`npm run explore -- path/to/file` —— 读整个文件。这是主路径，
+//     适合喂大段学习资料。绕开 readline 逐行读取的坑（大段多行文本会被 rl.question
+//     在第一个换行处截断，且 stdin 重定向下遇 EOF 直接返回空——正是你踩到的两个坑）。
+//   · 无参数：回退到交互式单行输入，方便快速试一句话。
 // ─────────────────────────────────────────────────────────────────────────────
 async function main(): Promise<void> {
+    // process.argv: [node, 脚本路径, ...真正的参数]。取第一个位置参数当文件路径。
+    const filePath = process.argv[2]
+
+    if (filePath) {
+        const text = readFileSync(filePath, "utf-8").trim()
+        if (!text) {
+            console.error(`文件为空：${filePath}`)
+            return
+        }
+        console.log(`读入资料：${filePath}（${text.length} 字）`)
+        await runExplore(text)
+        return
+    }
+
+    // 无文件参数 → 交互式单行输入（仅适合一句话；大段文本请用文件参数）。
     const rl = readline.createInterface({
         input: process.stdin,
         output: process.stdout,
     })
-
     const query = await rl.question("> ")
     rl.close()
-
     if (query.trim()) await runExplore(query.trim())
 }
 
-main()
+// 仅在被直接运行时启动 CLI；被 import（如测试渲染）时不自动跑 main。
+if (import.meta.url === `file://${process.argv[1]}`) {
+    main()
+}

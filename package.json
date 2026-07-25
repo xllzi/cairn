@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "tsx test/render.test.ts",
     "hello": "tsx src/hello.ts",
     "explore": "tsx src/explore.ts"
   },
