@@ -1,5 +1,7 @@
 import "dotenv/config"
 import OpenAI from "openai"
+import { zodResponsesFunction } from "openai/helpers/zod"
+import { z } from "zod"
 import readline from "readline/promises"
 import { readFileSync } from "node:fs"
 
@@ -21,25 +23,29 @@ import { readFileSync } from "node:fs"
  */
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 领域类型：知识图谱的形状。
-// 这是「领域边界」——在这里收紧类型最值钱：图谱结构一旦定死，下游都受它保护。
+// 领域类型：知识图谱的形状。用 zod 定义一次，同时得到运行时校验（.parse）和
+// 静态类型（z.infer）——这是「领域边界」，图谱结构一旦定死，下游都受它保护。
 // ─────────────────────────────────────────────────────────────────────────────
-interface GraphNode {
-    id: string          // 稳定标识，英文 kebab-case，如 "spaced-repetition"
-    label: string       // 展示名（可中文）
-    type: string        // 概念类别
-}
+const GraphNodeSchema = z.object({
+    id: z.string(),          // 稳定标识，英文 kebab-case，如 "spaced-repetition"
+    label: z.string(),       // 展示名（可中文）
+    type: z.string(),        // 概念类别
+})
 
-interface GraphEdge {
-    from: string        // 源节点 id
-    to: string          // 目标节点 id
-    relation: string    // 关系描述，如 "对抗" | "属于"
-}
+const GraphEdgeSchema = z.object({
+    from: z.string(),        // 源节点 id
+    to: z.string(),          // 目标节点 id
+    relation: z.string(),    // 关系描述，如 "对抗" | "属于"
+})
 
-interface KnowledgeGraph {
-    nodes: GraphNode[]
-    edges: GraphEdge[]
-}
+const KnowledgeGraphSchema = z.object({
+    nodes: z.array(GraphNodeSchema),
+    edges: z.array(GraphEdgeSchema),
+})
+
+type GraphNode = z.infer<typeof GraphNodeSchema>
+type GraphEdge = z.infer<typeof GraphEdgeSchema>
+type KnowledgeGraph = z.infer<typeof KnowledgeGraphSchema>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 客户端。沿用 hello.ts：openai SDK 指向百炼 OpenAI 兼容端点。
@@ -53,57 +59,17 @@ const MODEL = "qwen3.7-plus"
 const MAX_STEPS = 7   // 兜底：防止模型陷入死循环，永远不收尾
 
 // ─────────────────────────────────────────────────────────────────────────────
-// constructKnowledgeGraph 的参数 schema 就是「最终输出的形状」。
-// 用 JSON Schema 描述上面的 KnowledgeGraph：一个 object，含 nodes 数组和 edges 数组，
-// 每个 node 有 id/label/type，每个 edge 有 from/to/relation，全部 required，
-// additionalProperties: false。写完后它必须和 interface KnowledgeGraph 对得上。
-// 参考形状见文件顶部注释。
-// ─────────────────────────────────────────────────────────────────────────────
-const KNOWLEDGE_GRAPH_PARAMETERS: Record<string, unknown> = {
-    type: "object",
-    properties: {
-        nodes: { 
-            type: "array", 
-            items: { 
-                type: "object",
-                properties: {
-                    id: { type: "string" },
-                    label: { type: "string" },
-                    type: { type: "string" },
-                },
-                required: ["id", "label", "type"]
-            }, 
-        },
-        edges: {
-            type: "array",
-            items: {
-                type: "object",
-                properties: {
-                    from: { type: "string" },
-                    to: { type: "string" },
-                    relation: { type: "string" },
-                },
-                required: ["from", "to", "relation"]
-            },
-        }
-    },
-    required: ["nodes", "edges"],
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // 工具集：本阶段只有一个 —— 自定义 emit 工具。抽取是模型的「思考」，不做成工具；
 // 也不放 web_search（本阶段不向外收集）。
+// zodResponsesFunction 直接从 KnowledgeGraphSchema 派生 JSON Schema（strict 模式、
+// additionalProperties: false 都自动处理），不必再手写一份对得上的 JSON Schema。
 // ─────────────────────────────────────────────────────────────────────────────
 const tools: OpenAI.Responses.Tool[] = [
-    // 自定义函数工具 = 终止动作 / emit。模型调它 = 宣告「我抽完了」。
-    {
-        type: "function",
+    zodResponsesFunction({
         name: "constructKnowledgeGraph",
-        description:
-            "在你收集到足够信息、完成概念与关系抽取后调用它",
-        parameters: KNOWLEDGE_GRAPH_PARAMETERS,
-        strict: true,
-    },
+        description: "在你收集到足够信息、完成概念与关系抽取后调用它",
+        parameters: KnowledgeGraphSchema,
+    }),
 ]
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -160,20 +126,20 @@ async function executeFunctionCall(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 这里是「一块 cairn」——[[Context Version Control]] 里的可审阅检查点。要做的事：
-//   a. 把 args 校验/收窄成 KnowledgeGraph（可信任 strict schema，但仍建议基本校验）。
-//   在思考步骤，Agent抽取概念，建立联系，应当输出一个JSON作为参数，能解析为KnowledgeGraph
+//   a. 用 KnowledgeGraphSchema 校验 args（strict tool schema 已经把住了大部分形状，
+//      这里再校验一遍是防御性的最后一道关——模型偶尔仍会吐出不合规的 JSON）。
 //   b. 人工检查点：把图谱摊开打印给用户看，暂停确认（读一行 stdin），再决定是否「提交」。
-//   c. 返回一段字符串作为 Observation（比如 "已保存，12 个节点 / 18 条边" 或 "用户拒绝"）。
+//   c. 返回一段字符串作为 Observation（比如 "已保存，12 个节点 / 18 条边" 或校验失败原因）。
 // ─────────────────────────────────────────────────────────────────────────────
 function constructKnowledgeGraph(args: unknown): string {
-    try {
-        const graph = parseKnowledgeGraph(args);
-        // 可审阅：把图谱摊成人能扫读的文本，而不是一坨 JSON。这一步是「可观测性」的落点。
-        console.log(renderKnowledgeGraph(graph));
-        return `construct ${graph.nodes.length} nodes and ${graph.edges.length} edges`;
-    } catch (e) {
-        return `KnowledgeGraph verificaton fail: ${(e as Error).message}`
+    const result = KnowledgeGraphSchema.safeParse(args)
+    if (!result.success) {
+        return `KnowledgeGraph verification fail: ${z.prettifyError(result.error)}`
     }
+    const graph = result.data
+    // 可审阅：把图谱摊成人能扫读的文本，而不是一坨 JSON。这一步是「可观测性」的落点。
+    console.log(renderKnowledgeGraph(graph))
+    return `construct ${graph.nodes.length} nodes and ${graph.edges.length} edges`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -243,34 +209,8 @@ export function renderKnowledgeGraph(graph: KnowledgeGraph): string {
     return lines.join("\n")
 }
 
-function isGraphNode(x: unknown): x is GraphNode {
-    return typeof x === "object" && x !== null &&
-        typeof (x as Record<string, unknown>).id === "string" &&
-        typeof (x as Record<string, unknown>).label === "string" &&
-        typeof (x as Record<string, unknown>).type === "string"
-}
-
-function isGraphEdge(x: unknown): x is GraphEdge {
-    return typeof x === "object" && x !== null &&
-        typeof (x as Record<string, unknown>).from === "string" &&
-        typeof (x as Record<string, unknown>).to === "string" &&
-        typeof (x as Record<string, unknown>).relation === "string"
-}
-
-function parseKnowledgeGraph(x: unknown): KnowledgeGraph {
-    if (typeof x !== "object" || x === null) throw new Error("root is not object");
-    const obj = x as Record<string, unknown>;
-    if (!Array.isArray(obj.nodes)) throw new Error("lack nodes array");
-    if (!Array.isArray(obj.edges)) throw new Error("lack edges array");
-    if (!obj.nodes.every(isGraphNode)) throw new Error("wrong node shape");
-    if (!obj.edges.every(isGraphEdge)) throw new Error("wrong edge shape");
-    return { nodes: obj.nodes, edges: obj.edges };
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Agent Loop：感知 → 思考 → 行动 → 观察 → 回到感知。
-// input 数组就是「可见的记忆」——每一轮的 Thought / Action / Observation 都留痕在里面，
-// 正对应你笔记里「把 observation 回灌」的图像。
 // ─────────────────────────────────────────────────────────────────────────────
 async function runExplore(query: string): Promise<void> {
     // 感知（起点）：用户的初始目标就是第一个 observation。
@@ -311,8 +251,8 @@ async function runExplore(query: string): Promise<void> {
 
         // 行动 + 观察：逐个执行，把结果作为 function_call_output 回灌。
         for (const call of functionCalls) {
-            const observation = await executeFunctionCall(call)   // 行动 Action
-            input.push({                                          // 观察 Observation
+            const observation = await executeFunctionCall(call)   // 行动
+            input.push({                                          // 观察
                 type: "function_call_output",
                 call_id: call.call_id,
                 output: observation,
@@ -323,7 +263,7 @@ async function runExplore(query: string): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CLI 入口。两种喂料方式：
+// CLI 入口。
 //   · 有文件参数：`npm run explore -- path/to/file` —— 读整个文件。这是主路径，
 //     适合喂大段学习资料。绕开 readline 逐行读取的坑（大段多行文本会被 rl.question
 //     在第一个换行处截断，且 stdin 重定向下遇 EOF 直接返回空——正是你踩到的两个坑）。
