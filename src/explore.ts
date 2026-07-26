@@ -4,48 +4,40 @@ import { zodResponsesFunction } from "openai/helpers/zod"
 import { z } from "zod"
 import readline from "readline/promises"
 import { readFileSync } from "node:fs"
+import {
+    GraphNodeSchema,
+    GraphEdgeSchema,
+    KnowledgeGraphSchema,
+    type KnowledgeGraph,
+    renderKnowledgeGraph,
+    beginRound,
+    getCommittedGraph,
+    getStaged,
+    addConceptToStage,
+    addRelationToStage,
+    commitRound,
+    discardRound,
+} from "./graph.ts"
 
 /**
- * Cairn · Phase 1 · Explore MVP
+ * Cairn · Phase 1-2 · Explore：单次抽取 + 追问驱动的增量建图
  * 一个「感知-思考-行动」的 Agent Loop 骨架（Responses API 版）。
  *
- * 本阶段范围（已定）：不搜网、不抓 URL —— 纯靠 LLM 自身世界模型，对输入的
+ * Round 0（初始抽取）：不搜网、不抓 URL —— 纯靠 LLM 自身世界模型，对输入的
  *   一段文本做「单次」概念/关系抽取，调用自定义函数 constructKnowledgeGraph
- *   把图谱交回来。因此循环通常只转一圈（思考一次 → emit 一次 → 收尾）。
- *   增量建图（addConcept/addRelation 让循环真正多轮迭代）留到后续阶段，
- *   它正是从这个 emit 长出来的地方。
+ *   把图谱交回来。
+ * 增量轮（追问驱动）：CLI 抽取完不退出，持续接受用户追问；每条追问触发新一轮
+ *   循环，模型改用 addConcept/addRelation 两个细粒度工具补充图谱，可在一轮内
+ *   多次调用、靠 observation 反馈自我修正（重复 id / 悬空引用都会被拒绝）。
+ * 每一轮（round 0 与追问轮统一）结束后，先把产出暂存，摊开给用户看一遍，
+ *   人工确认是否并入正式图谱——这是 [[Cairn Agent Loop]] 说的「方向盘在人手里」。
  *
  * 循环协议（对应 [[Agent]] 笔记的 Thought-Action-Observation）：
  *   感知 Perception  = input 数组里最新的内容（用户给的文本，或上一步的 observation）
  *   思考 Thought     = client.responses.create(...) —— 模型脑内抽取概念与关系
- *   行动 Action      = 执行模型选中的 function_call（这里就是 emit 图谱）
+ *   行动 Action      = 执行模型选中的 function_call（emit 图谱 / 暂存增量）
  *   观察 Observation = 把执行结果作为 function_call_output 回灌进 input
  */
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 领域类型：知识图谱的形状。用 zod 定义一次，同时得到运行时校验（.parse）和
-// 静态类型（z.infer）——这是「领域边界」，图谱结构一旦定死，下游都受它保护。
-// ─────────────────────────────────────────────────────────────────────────────
-const GraphNodeSchema = z.object({
-    id: z.string(),          // 稳定标识，英文 kebab-case，如 "spaced-repetition"
-    label: z.string(),       // 展示名（可中文）
-    type: z.string(),        // 概念类别
-})
-
-const GraphEdgeSchema = z.object({
-    from: z.string(),        // 源节点 id
-    to: z.string(),          // 目标节点 id
-    relation: z.string(),    // 关系描述，如 "对抗" | "属于"
-})
-
-const KnowledgeGraphSchema = z.object({
-    nodes: z.array(GraphNodeSchema),
-    edges: z.array(GraphEdgeSchema),
-})
-
-type GraphNode = z.infer<typeof GraphNodeSchema>
-type GraphEdge = z.infer<typeof GraphEdgeSchema>
-type KnowledgeGraph = z.infer<typeof KnowledgeGraphSchema>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 客户端。沿用 hello.ts：openai SDK 指向百炼 OpenAI 兼容端点。
@@ -59,16 +51,28 @@ const MODEL = "qwen3.7-plus"
 const MAX_STEPS = 7   // 兜底：防止模型陷入死循环，永远不收尾
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 工具集：本阶段只有一个 —— 自定义 emit 工具。抽取是模型的「思考」，不做成工具；
-// 也不放 web_search（本阶段不向外收集）。
-// zodResponsesFunction 直接从 KnowledgeGraphSchema 派生 JSON Schema（strict 模式、
-// additionalProperties: false 都自动处理），不必再手写一份对得上的 JSON Schema。
+// 工具集：round 0 只有一个批量 emit 工具；增量轮换成两个细粒度工具。
+// zodResponsesFunction 直接从 graph.ts 的 schema 派生 JSON Schema（strict 模式、
+// additionalProperties: false 都自动处理），不必手写一份对得上的 JSON Schema。
 // ─────────────────────────────────────────────────────────────────────────────
-const tools: OpenAI.Responses.Tool[] = [
+const round0Tools: OpenAI.Responses.Tool[] = [
     zodResponsesFunction({
         name: "constructKnowledgeGraph",
         description: "在你收集到足够信息、完成概念与关系抽取后调用它",
         parameters: KnowledgeGraphSchema,
+    }),
+]
+
+const incrementalTools: OpenAI.Responses.Tool[] = [
+    zodResponsesFunction({
+        name: "addConcept",
+        description: "在追问轮次中，向图谱补充一个此前未覆盖的核心概念",
+        parameters: GraphNodeSchema,
+    }),
+    zodResponsesFunction({
+        name: "addRelation",
+        description: "在追问轮次中，补充两个已存在概念（已提交或本轮已通过 addConcept 补充）之间的关系",
+        parameters: GraphEdgeSchema,
     }),
 ]
 
@@ -84,11 +88,11 @@ const LEARNER_PROFILE = `
 `.trim()
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 提示词设计（本阶段要吃透的核心概念之一）。几个刻意的取舍：
+// Round 0 提示词设计。几个刻意的取舍：
 //   · 引用 LEARNER_PROFILE：让「抽什么」随学习者背景而变，而非对资料穷举。
 //   · 少而精：明确要求聚焦最核心的少量概念（软上限 5-7 个），先立骨干。
 //     ——直接回应「概念太多」：穷举会淹没初学者，主干清晰才谈得上心智模型。
-//   · 留话头：说明后续追问时才增量补充。这为「增量建图」埋点，但本阶段不实现。
+//   · 留话头：说明后续追问时才增量补充。这为「增量建图」埋点，现已在增量轮实现。
 //   · 收尾契约：必须以调用 constructKnowledgeGraph 结束，别用自然语言把图谱「说」出来。
 // ─────────────────────────────────────────────────────────────────────────────
 const INSTRUCTIONS = `
@@ -107,6 +111,32 @@ ${LEARNER_PROFILE}
 `.trim()
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 增量轮提示词：函数而非静态常量，因为要把「当前已有图谱」内嵌进去，让模型
+// 知道有哪些概念已经存在（别重复加）、可以引用哪些 id。
+// ─────────────────────────────────────────────────────────────────────────────
+function buildIncrementalInstructions(currentGraph: KnowledgeGraph): string {
+    return `
+你是学习者的学习助手与陪伴者。学习者正在追问，请围绕追问内容为已有知识图谱补充相关的概念和关系——不要重新抽取整张图，只增量补充追问相关的部分。
+
+学习者画像：
+${LEARNER_PROFILE}
+
+当前已有的图谱（不要重复添加已存在的概念；引用已有概念时使用下面列出的 id）：
+${renderKnowledgeGraph(currentGraph)}
+
+工具：
+- addConcept：补充一个新概念（id 已存在会报错，换一个 id 或跳过）。
+- addRelation：补充一条新关系，from/to 必须引用已存在或本轮已通过 addConcept 添加的概念 id（引用不存在的 id 会报错）。
+
+追加原则：
+- 少而精，只补充与追问直接相关的少量概念/关系，不求全。
+- 可多次调用 addConcept / addRelation；工具报错后请在下一步修正重试。
+
+收尾：完成补充后不要再调用工具，也不要用自然语言复述你添加的内容——停止即表示这一轮结束。
+`.trim()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 行动 Action：执行模型选中的 function_call，返回一段字符串作为 Observation。
 // ─────────────────────────────────────────────────────────────────────────────
 async function executeFunctionCall(
@@ -118,6 +148,10 @@ async function executeFunctionCall(
     switch (call.name) {
         case "constructKnowledgeGraph":
             return constructKnowledgeGraph(args)
+        case "addConcept":
+            return addConceptToStage(args)
+        case "addRelation":
+            return addRelationToStage(args)
         default:
             // 模型调了个我们没注册的函数：把错误如实回灌，让它下一轮纠正。
             return `Error: unknown function "${call.name}"`
@@ -125,124 +159,50 @@ async function executeFunctionCall(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 这里是「一块 cairn」——[[Context Version Control]] 里的可审阅检查点。要做的事：
-//   a. 用 KnowledgeGraphSchema 校验 args（strict tool schema 已经把住了大部分形状，
-//      这里再校验一遍是防御性的最后一道关——模型偶尔仍会吐出不合规的 JSON）。
-//   b. 人工检查点：把图谱摊开打印给用户看，暂停确认（读一行 stdin），再决定是否「提交」。
-//   c. 返回一段字符串作为 Observation（比如 "已保存，12 个节点 / 18 条边" 或校验失败原因）。
+// Round 0 的工具执行函数：校验通过后把整张图批量塞进暂存区（不是逐个调用
+// addConceptToStage），是否落地交给统一的 runRound 确认流程决定。
 // ─────────────────────────────────────────────────────────────────────────────
 function constructKnowledgeGraph(args: unknown): string {
     const result = KnowledgeGraphSchema.safeParse(args)
     if (!result.success) {
         return `KnowledgeGraph verification fail: ${z.prettifyError(result.error)}`
     }
-    const graph = result.data
-    // 可审阅：把图谱摊成人能扫读的文本，而不是一坨 JSON。这一步是「可观测性」的落点。
-    console.log(renderKnowledgeGraph(graph))
-    return `construct ${graph.nodes.length} nodes and ${graph.edges.length} edges`
+    const { nodes, edges } = getStaged()
+    nodes.push(...result.data.nodes)
+    edges.push(...result.data.edges)
+    return `construct ${result.data.nodes.length} nodes and ${result.data.edges.length} edges`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 渲染：把 KnowledgeGraph 排版成人能扫一眼看懂的文本。纯函数、无副作用——
-// 只吃一个 graph、吐一个 string，好测、好复用，和「执行/IO」分开。
-//
-// 不引入 chalk 等库，直接用 ANSI 转义码上色（先原语，不给学习骨架加噪音）。
-// 呈现三块：① 摘要 ② 概念按 type 分组 ③ 关系用 起点 ──关系──▶ 终点。
-// 顺带做「悬空边」检测：边引用了不存在的 node id → 标红，这正是审阅时最该看见的。
+// Agent Loop：感知 → 思考 → 行动 → 观察 → 回到感知。round 0 和增量轮共用同一套
+// 循环机制，只有 tools/instructions 不同。
 // ─────────────────────────────────────────────────────────────────────────────
-const C = {
-    dim: (s: string) => `\x1b[2m${s}\x1b[0m`,        // 灰：次要信息（id）
-    bold: (s: string) => `\x1b[1m${s}\x1b[0m`,       // 粗：标题
-    cyan: (s: string) => `\x1b[36m${s}\x1b[0m`,      // 青：概念 label
-    yellow: (s: string) => `\x1b[33m${s}\x1b[0m`,    // 黄：关系
-    red: (s: string) => `\x1b[31m${s}\x1b[0m`,       // 红：悬空边告警
-}
-
-export function renderKnowledgeGraph(graph: KnowledgeGraph): string {
-    const { nodes, edges } = graph
-    const lines: string[] = []
-
-    // ① 摘要
-    lines.push("")
-    lines.push(C.bold(`◆ 知识图谱  ${nodes.length} 个概念 · ${edges.length} 条关系`))
-
-    // 建 id → node 索引：既给关系渲染用 label，也用来查悬空边。
-    const byId = new Map(nodes.map((n) => [n.id, n]))
-
-    // ② 概念：按 type 分组
-    lines.push("")
-    lines.push(C.bold("概念"))
-    const groups = new Map<string, GraphNode[]>()
-    for (const n of nodes) {
-        const g = groups.get(n.type) ?? []
-        g.push(n)
-        groups.set(n.type, g)
-    }
-    for (const [type, members] of groups) {
-        lines.push(`  ${C.dim("┌")} ${type}`)
-        for (const n of members) {
-            lines.push(`  ${C.dim("│")}   ${C.cyan(n.label)}  ${C.dim(n.id)}`)
-        }
-    }
-
-    // ③ 关系：起点 ──关系──▶ 终点。用 label 显示（找不到就退回 id 并标红）。
-    lines.push("")
-    lines.push(C.bold("关系"))
-    const danglingSeen = new Set<string>()
-    const nameOf = (id: string): string => {
-        const node = byId.get(id)
-        if (node) return C.cyan(node.label)
-        danglingSeen.add(id)
-        return C.red(`${id}?`)   // 悬空：这个 id 没有对应节点
-    }
-    for (const e of edges) {
-        lines.push(`  ${nameOf(e.from)} ${C.dim("──")}${C.yellow(e.relation)}${C.dim("──▶")} ${nameOf(e.to)}`)
-    }
-
-    // 悬空边告警：审阅时最该被看见的完整性问题。
-    if (danglingSeen.size > 0) {
-        lines.push("")
-        lines.push(C.red(`⚠ ${danglingSeen.size} 个悬空引用（边指向了不存在的概念）：${[...danglingSeen].join(", ")}`))
-    }
-
-    lines.push("")
-    return lines.join("\n")
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Agent Loop：感知 → 思考 → 行动 → 观察 → 回到感知。
-// ─────────────────────────────────────────────────────────────────────────────
-async function runExplore(query: string): Promise<void> {
-    // 感知（起点）：用户的初始目标就是第一个 observation。
-    const input: OpenAI.Responses.ResponseInput = [
-        { role: "user", content: query },
-    ]
-
+async function runAgentLoop(
+    input: OpenAI.Responses.ResponseInput,
+    tools: OpenAI.Responses.Tool[],
+    instructions: string,
+): Promise<void> {
     for (let step = 1; step <= MAX_STEPS; step++) {
         console.log(`\n──────── step ${step} ────────`)
 
         // 思考 Thought：模型基于当前 input 规划下一步、选工具。
-        // 提示：单次 emit 想更可靠，可加 tool_choice 逼它必须调 constructKnowledgeGraph，
-        // 而不是用自然语言把图谱「说」出来。写法（可选）：
-        //   tool_choice: { type: "function", name: "constructKnowledgeGraph" }
         const response = await client.responses.create({
             model: MODEL,
             input,
             tools,
-            instructions: INSTRUCTIONS,
+            instructions,
         })
 
         // 可见化：打印模型这一轮的自然语言部分（它的「思考快照」）。
         if (response.output_text) console.log("💭", response.output_text)
 
         // 从输出里挑出「行动」：我们要手动执行的 function_call 项。
-        // 本阶段只有一个可能出现：constructKnowledgeGraph。
         const functionCalls = response.output.filter(
             (item): item is OpenAI.Responses.ResponseFunctionToolCall =>
                 item.type === "function_call",
         )
 
-        // 终止条件之一：模型不再行动 = 它认为任务结束（或只想说话）。
+        // 终止条件：模型不再行动 = 它认为这一轮任务结束（或只想说话）。
         if (functionCalls.length === 0) break
 
         // 回灌①：先把模型的 function_call 决策塞回 input，
@@ -258,12 +218,60 @@ async function runExplore(query: string): Promise<void> {
                 output: observation,
             })
         }
-
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CLI 入口。
+// 一轮的完整生命周期：清空暂存 → 跑 agent loop → 若有产出，摊开「已提交 + 暂存」
+// 的合并图谱（新增部分高亮）→ 人工确认 → 并入或丢弃。round 0 与每条追问都走这里。
+// ─────────────────────────────────────────────────────────────────────────────
+async function runRound(
+    query: string,
+    tools: OpenAI.Responses.Tool[],
+    instructions: string,
+    rl: readline.Interface,
+): Promise<void> {
+    beginRound()
+
+    const input: OpenAI.Responses.ResponseInput = [
+        { role: "user", content: query },
+    ]
+    await runAgentLoop(input, tools, instructions)
+
+    const staged = getStaged()
+    if (staged.nodes.length === 0 && staged.edges.length === 0) {
+        console.log("（这一轮没有产出新内容）")
+        return
+    }
+
+    // 确认视图：已提交图谱 + 本轮暂存内容合并渲染，新增部分标绿——
+    // 这样暂存的边即使指向已提交节点，也不会被悬空边检测误判。
+    const committed = getCommittedGraph()
+    const merged: KnowledgeGraph = {
+        nodes: [...committed.nodes, ...staged.nodes],
+        edges: [...committed.edges, ...staged.edges],
+    }
+    console.log(renderKnowledgeGraph(merged, {
+        newNodeIds: new Set(staged.nodes.map((n) => n.id)),
+        newEdgeIndices: new Set(staged.edges.map((_, i) => committed.edges.length + i)),
+    }))
+
+    const answer = (await rl.question(
+        `并入 ${staged.nodes.length} 个概念 / ${staged.edges.length} 条关系？(y/n) `,
+    )).trim().toLowerCase()
+
+    if (answer === "y" || answer === "yes") {
+        commitRound()
+        console.log("✓ 已并入")
+    } else {
+        discardRound()
+        console.log("✗ 已丢弃")
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLI 入口：round 0（文件参数或单行交互输入）之后不退出，进入追问 REPL——
+// 每条追问触发一轮增量建图，直到用户输入 :q 或 exit。
 //   · 有文件参数：`npm run explore -- path/to/file` —— 读整个文件。这是主路径，
 //     适合喂大段学习资料。绕开 readline 逐行读取的坑（大段多行文本会被 rl.question
 //     在第一个换行处截断，且 stdin 重定向下遇 EOF 直接返回空——正是你踩到的两个坑）。
@@ -272,26 +280,40 @@ async function runExplore(query: string): Promise<void> {
 async function main(): Promise<void> {
     // process.argv: [node, 脚本路径, ...真正的参数]。取第一个位置参数当文件路径。
     const filePath = process.argv[2]
-
-    if (filePath) {
-        const text = readFileSync(filePath, "utf-8").trim()
-        if (!text) {
-            console.error(`文件为空：${filePath}`)
-            return
-        }
-        console.log(`读入资料：${filePath}（${text.length} 字）`)
-        await runExplore(text)
-        return
-    }
-
-    // 无文件参数 → 交互式单行输入（仅适合一句话；大段文本请用文件参数）。
     const rl = readline.createInterface({
         input: process.stdin,
         output: process.stdout,
     })
-    const query = await rl.question("> ")
+
+    let firstQuery: string
+    if (filePath) {
+        const text = readFileSync(filePath, "utf-8").trim()
+        if (!text) {
+            console.error(`文件为空：${filePath}`)
+            rl.close()
+            return
+        }
+        console.log(`读入资料：${filePath}（${text.length} 字）`)
+        firstQuery = text
+    } else {
+        firstQuery = (await rl.question("> ")).trim()
+        if (!firstQuery) {
+            rl.close()
+            return
+        }
+    }
+
+    await runRound(firstQuery, round0Tools, INSTRUCTIONS, rl)
+
+    // 追问 REPL：:q / exit 退出，空行只是重新提示（不退出，避免误触）。
+    while (true) {
+        const followUp = (await rl.question("\n追问（:q 或 exit 退出）> ")).trim()
+        if (/^(:q|exit)$/i.test(followUp)) break
+        if (!followUp) continue
+        await runRound(followUp, incrementalTools, buildIncrementalInstructions(getCommittedGraph()), rl)
+    }
+
     rl.close()
-    if (query.trim()) await runExplore(query.trim())
 }
 
 // 仅在被直接运行时启动 CLI；被 import（如测试渲染）时不自动跑 main。
